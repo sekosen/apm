@@ -234,3 +234,91 @@ class TestSinglePointPlacementNonRootLCA:
         assert rel.as_posix() == "Engine/Plugins", (
             f"expected LCA Engine/Plugins, got {rel.as_posix()}"
         )
+
+
+class TestRelPathAndResolvedDirCacheReset:
+    """Regression coverage for the per-compile reset of ``_rel_path_cache``
+    and ``_resolved_dir_cache`` at the start of ``optimize_instruction_placement``.
+    """
+
+    def test_rel_path_cache_does_not_leak_a_poisoned_entry_into_next_call(
+        self, tmp_path: Path
+    ) -> None:
+        """A stale ``_rel_path_cache`` entry from a prior compile must not survive.
+
+        If ``_rel_path_cache`` weren't cleared, a wrong entry planted between
+        two calls (standing in for a prior compile's now-stale resolution)
+        would keep being served on the next one instead of being recomputed.
+        """
+        _touch(tmp_path, "vendor/Button.ts")
+        link = tmp_path / "src" / "components" / "Button.ts"
+        link.parent.mkdir(parents=True)
+        try:
+            link.symlink_to(tmp_path / "vendor" / "Button.ts")
+        except OSError:
+            pytest.skip("symlink creation not supported on this platform")
+
+        optimizer = ContextOptimizer(base_dir=str(tmp_path))
+        # "**/*.ts" has no literal top-level root, so the scan isn't narrowed
+        # to "vendor" -- it must also walk "src" to reach the symlink.
+        instruction = Instruction(
+            name="ts-standards",
+            file_path=Path("ts.instructions.md"),
+            description="d",
+            apply_to="**/*.ts",
+            content="c",
+        )
+        optimizer.optimize_instruction_placement([instruction])
+        assert optimizer._rel_path_cache[link] == "vendor/Button.ts"
+
+        # Poison the cache with a resolution that would misdirect matching if it survived.
+        optimizer._rel_path_cache[link] = "somewhere/else/entirely.ts"
+
+        optimizer.optimize_instruction_placement([instruction])
+        assert optimizer._rel_path_cache[link] == "vendor/Button.ts"
+
+    def test_resolved_dir_cache_cleared_before_next_optimize_call(self, tmp_path: Path) -> None:
+        """A stale ``_resolved_dir_cache`` entry from a prior compile must not survive."""
+        _touch(tmp_path, "src/a.py")
+        optimizer = ContextOptimizer(base_dir=str(tmp_path))
+        instruction = Instruction(
+            name="i",
+            file_path=Path("i.instructions.md"),
+            description="d",
+            apply_to="**/*.py",
+            content="c",
+        )
+        optimizer.optimize_instruction_placement([instruction])
+
+        # Poison the cache with a mapping that would misdirect a lookup if it survived.
+        stale_key = tmp_path / "nonexistent"
+        optimizer._resolved_dir_cache[stale_key] = tmp_path.resolve()
+
+        optimizer.optimize_instruction_placement([instruction])
+
+        assert stale_key not in optimizer._resolved_dir_cache
+
+
+class TestSinglePlacementCoversAll:
+    """Direct coverage for ``_single_placement_covers_all``'s short-circuit-on-first-miss.
+
+    Otherwise only exercised indirectly (see ``TestSinglePointPlacementNonRootLCA``).
+    """
+
+    def test_true_when_placement_covers_every_target(self, tmp_path: Path) -> None:
+        a = tmp_path / "src" / "a"
+        b = tmp_path / "src" / "b"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+        optimizer = ContextOptimizer(base_dir=str(tmp_path))
+
+        assert optimizer._single_placement_covers_all(tmp_path / "src", {a, b}) is True
+
+    def test_false_on_first_target_not_covered(self, tmp_path: Path) -> None:
+        a = tmp_path / "src" / "a"
+        outside = tmp_path / "other"
+        a.mkdir(parents=True)
+        outside.mkdir()
+        optimizer = ContextOptimizer(base_dir=str(tmp_path))
+
+        assert optimizer._single_placement_covers_all(tmp_path / "src", {a, outside}) is False
